@@ -87,25 +87,22 @@ namespace ChatPlexMod_MenuMusic
         /// </summary>
         protected override void OnDisable()
         {
-            /// Unbind event
+            CancelPendingMusic();
+
             Application.wantsToQuit                             -= Application_wantsToQuit;
             CP_SDK.Chat.Service.Discrete_OnTextMessageReceived  -= ChatService_Discrete_OnTextMessageReceived;
             CP_SDK.ChatPlexSDK.OnGenericSceneChange             -= ChatPlexSDK_OnGenericSceneChange;
 
-            /// Stop wait and play next song coroutine
-            if (m_WaitAndPlayNextSongCoroutine != null)
-            {
-                CP_SDK.Unity.MTCoroutineStarter.Stop(m_WaitAndPlayNextSongCoroutine);
-                m_WaitAndPlayNextSongCoroutine = null;
-            }
-
-            /// Destroy floating window
             DestroyFloatingPlayer();
 
             CP_SDK.UI.UISystem.DestroyUI(ref m_SettingsLeftView);
             CP_SDK.UI.UISystem.DestroyUI(ref m_SettingsMainView);
 
-            /// Restore original settings
+            RestoreOriginalPlayback();
+        }
+
+        private void RestoreOriginalPlayback()
+        {
             if (!m_WantsToQuit && m_PreviewPlayer != null && m_OriginalMenuMusic != null)
             {
                 m_PreviewPlayer._defaultAudioClip   = m_OriginalMenuMusic;
@@ -140,9 +137,9 @@ namespace ChatPlexMod_MenuMusic
         /// <param name="p_Scene">Scene type</param>
         private void ChatPlexSDK_OnGenericSceneChange(CP_SDK.EGenericScene p_Scene)
         {
-            /// Skip if it's not the menu
             if (p_Scene != CP_SDK.EGenericScene.Menu)
             {
+                CancelPendingMusic();
                 if (m_PreviewPlayer != null && m_PreviewPlayer && m_OriginalMenuMusic != null && m_OriginalMenuMusic)
                     m_PreviewPlayer._defaultAudioClip = m_OriginalMenuMusic;
 
@@ -151,14 +148,9 @@ namespace ChatPlexMod_MenuMusic
                 return;
             }
 
-            /// Create player window
             if (MMConfig.Instance.ShowPlayer)
                 CreateFloatingPlayer();
 
-            m_PreviewPlayer._ambientVolumeScale = 0f;
-            m_PreviewPlayer._volumeScale        = 0f;
-
-            /// Start a new music
             if (p_Scene != m_LastActiveScene && MMConfig.Instance.StartANewMusicOnSceneChange)
                 StartNewMusic(false, true);
             else
@@ -228,28 +220,7 @@ namespace ChatPlexMod_MenuMusic
             if (m_PreviewPlayer == null || !m_PreviewPlayer)
                 return;
 
-            if (CP_SDK.ChatPlexSDK.GetModules().Any(x => x.Name == "Audio Tweaker"))
-            {
-                var l_ChannelsController = m_PreviewPlayer._audioSourceControllers;
-                if (l_ChannelsController != null)
-                {
-                    for (var l_I = 0; l_I < l_ChannelsController.Length; ++l_I)
-                    {
-                        var l_ChannelController = l_ChannelsController[l_I];
-                        var l_Channel           = l_ChannelController.audioSource;
-                        if (l_Channel.isPlaying && l_Channel.clip == m_CurrentMusicAudioClip)
-                        {
-                            m_PreviewPlayer._ambientVolumeScale = 1.0f;
-                            m_PreviewPlayer._volumeScale        = 1.0f;
-                        }
-                    }
-                }
-            }
-            else
-            {
-                m_PreviewPlayer._ambientVolumeScale = MMConfig.Instance.PlaybackVolume;
-                m_PreviewPlayer._volumeScale        = MMConfig.Instance.PlaybackVolume;
-            }
+            ApplyPlaybackVolume();
 
             if (p_FromConfig && m_PlayerFloatingPanelView != null && m_PlayerFloatingPanelView)
                 m_PlayerFloatingPanelView.UpdateVolume();
@@ -259,6 +230,7 @@ namespace ChatPlexMod_MenuMusic
 
             MMConfig.Instance.Save();
         }
+
         /// <summary>
         /// Update player
         /// </summary>
@@ -477,9 +449,13 @@ namespace ChatPlexMod_MenuMusic
             MMConfig.Instance.Save();
 
             m_FastCancellationToken.Cancel();
+            int requestSerial = m_FastCancellationToken.Serial;
             l_MusicToLoad.GetAudioAsync(m_FastCancellationToken, (p_AudioClip) => {
-                CP_SDK.Unity.MTCoroutineStarter.EnqueueFromThread(Coroutine_LoadAudioClip(p_OnSceneTransition, l_MusicToLoad, p_AudioClip));
-            }, () => StartNextMusic());
+                CP_SDK.Unity.MTCoroutineStarter.EnqueueFromThread(Coroutine_LoadAudioClip(p_OnSceneTransition, l_MusicToLoad, p_AudioClip, requestSerial));
+            }, () => {
+                if (CanPlayRequest(requestSerial))
+                    StartNextMusic();
+            });
         }
 
         ////////////////////////////////////////////////////////////////////////////
@@ -500,105 +476,120 @@ namespace ChatPlexMod_MenuMusic
         /// </summary>
         /// <param name="p_OnSceneTransition">On scene transition?</param>
         /// <returns></returns>
-        private IEnumerator Coroutine_LoadAudioClip(bool p_OnSceneTransition, Data.Music p_Music, AudioClip p_AudioClip)
+        private IEnumerator Coroutine_LoadAudioClip(bool p_OnSceneTransition, Data.Music p_Music, AudioClip p_AudioClip, int requestSerial)
         {
-            if (m_WaitAndPlayNextSongCoroutine != null)
-            {
-                CP_SDK.Unity.MTCoroutineStarter.Stop(m_WaitAndPlayNextSongCoroutine);
-                m_WaitAndPlayNextSongCoroutine = null;
-            }
-
-            /// Skip if it's not the menu
-            if (CP_SDK.ChatPlexSDK.ActiveGenericScene != CP_SDK.EGenericScene.Menu)
+            if (!CanPlayRequest(requestSerial))
                 yield break;
 
-            yield return new WaitUntil(() => m_PreviewPlayer = Resources.FindObjectsOfTypeAll<SongPreviewPlayer>().First());
+            StopMusicPlaybackLoop();
+            yield return new WaitUntil(() => !CanPlayRequest(requestSerial)
+                || (m_PreviewPlayer = Resources.FindObjectsOfTypeAll<SongPreviewPlayer>().FirstOrDefault()));
+            if (!CanPlayRequest(requestSerial))
+                yield break;
 
-            if (p_OnSceneTransition)
+            bool resultWasPlaying = Patches.ResultSoundPlayback.IsPlaying(m_PreviewPlayer);
+            yield return new WaitUntil(() => !CanPlayRequest(requestSerial)
+                || !Patches.ResultSoundPlayback.IsPlaying(m_PreviewPlayer));
+            if (!CanPlayRequest(requestSerial))
+                yield break;
+
+            if (p_OnSceneTransition && !resultWasPlaying)
             {
-                if (m_PreviewPlayer)
-                    m_PreviewPlayer.FadeOut(m_PreviewPlayer._crossFadeToDefaultSpeed);
-
+                m_PreviewPlayer.FadeOut(m_PreviewPlayer._crossFadeToDefaultSpeed);
                 yield return new WaitForSeconds(2f);
             }
 
-            /// Skip if it's not the menu
-            if (CP_SDK.ChatPlexSDK.ActiveGenericScene != CP_SDK.EGenericScene.Menu)
+            yield return new WaitUntil(() => !CanPlayRequest(requestSerial) || !p_AudioClip
+                || ((p_AudioClip.loadState == AudioDataLoadState.Loaded || p_AudioClip.loadState == AudioDataLoadState.Failed)
+                    && !Patches.ResultSoundPlayback.IsPlaying(m_PreviewPlayer)));
+            if (!CanPlayRequest(requestSerial) || !m_PreviewPlayer || !p_AudioClip)
                 yield break;
 
-            m_CurrentMusic          = p_Music;
-            m_CurrentMusicAudioClip = p_AudioClip;
+            if (p_AudioClip.loadState == AudioDataLoadState.Loaded && TryPlayMusic(p_Music, p_AudioClip))
+                yield break;
 
-            if (m_PreviewPlayer != null && m_PreviewPlayer && m_CurrentMusicAudioClip != null)
+            yield return new WaitForSeconds(2f);
+            if (CanPlayRequest(requestSerial))
+                StartNextMusic();
+        }
+
+        private bool CanPlayRequest(int requestSerial)
+        {
+            return IsEnabled && CP_SDK.ChatPlexSDK.ActiveGenericScene == CP_SDK.EGenericScene.Menu
+                && !m_FastCancellationToken.IsCancelled(requestSerial);
+        }
+
+        private void CancelPendingMusic()
+        {
+            m_FastCancellationToken.Cancel();
+            Patches.ResultSoundPlayback.Clear();
+            StopMusicPlaybackLoop();
+            if (m_WaitUntillReadyCoroutine != null)
             {
-                /// Wait that the song is loaded in background
-                while (m_CurrentMusicAudioClip.loadState != AudioDataLoadState.Loaded
-                    && m_CurrentMusicAudioClip.loadState != AudioDataLoadState.Failed)
-                {
-                    yield return null;
-                }
-
-                /// Check if we changed scene during loading
-                if (!m_PreviewPlayer || CP_SDK.ChatPlexSDK.ActiveGenericScene != CP_SDK.EGenericScene.Menu)
-                    yield break;
-
-                if (m_CurrentMusicAudioClip.loadState == AudioDataLoadState.Loaded)
-                {
-                    bool l_Failed = false;
-
-                    try
-                    {
-                        if (m_WaitAndPlayNextSongCoroutine != null)
-                        {
-                            CP_SDK.Unity.MTCoroutineStarter.Stop(m_WaitAndPlayNextSongCoroutine);
-                            m_WaitAndPlayNextSongCoroutine = null;
-                        }
-
-                        m_PreviewPlayer._defaultAudioClip = m_CurrentMusicAudioClip;
-
-                        var l_Volume = MMConfig.Instance.PlaybackVolume;
-                        if (CP_SDK.ChatPlexSDK.GetModules().Any(x => x.Name == "Audio Tweaker"))
-                            l_Volume = 1.0f;
-
-                        m_PreviewPlayer._ambientVolumeScale = l_Volume;
-                        m_PreviewPlayer._volumeScale        = l_Volume;
-
-                        float l_StartTime = (MMConfig.Instance.StartSongFromBeginning || m_CurrentMusicAudioClip.length < 60) ? 0f : Mathf.Max(UnityEngine.Random.Range(m_CurrentMusicAudioClip.length * 0.2f, m_CurrentMusicAudioClip.length * 0.8f), 0.0f);
-
-                        m_PreviewPlayer.CrossfadeTo(m_CurrentMusicAudioClip, l_Volume, l_StartTime, -1f, () => { });
-
-                        m_BackupTimeClip    = m_CurrentMusicAudioClip;
-                        m_BackupTime        = l_StartTime;
-
-                        if (m_PlayerFloatingPanelView != null)
-                            m_PlayerFloatingPanelView.OnMusicChanged(p_Music);
-
-                        m_WaitAndPlayNextSongCoroutine = CP_SDK.Unity.MTCoroutineStarter.Start(Coroutine_WaitAndPlayNextMusic(m_CurrentMusicAudioClip.length));
-                    }
-                    catch (Exception p_Exception)
-                    {
-                        Logger.Instance.Error("Can't play audio! Exception: ");
-                        Logger.Instance.Error(p_Exception);
-
-                        l_Failed = true;
-                    }
-
-                    if (l_Failed)
-                    {
-                        /// Wait until next try
-                        yield return new WaitForSeconds(2f);
-
-                        /// Try next music if loading failed
-                        if (CP_SDK.ChatPlexSDK.ActiveGenericScene == CP_SDK.EGenericScene.Menu)
-                            StartNextMusic();
-
-                        yield break;
-                    }
-                }
-                /// Try next music if loading failed
-                else
-                    StartNextMusic();
+                CP_SDK.Unity.MTCoroutineStarter.Stop(m_WaitUntillReadyCoroutine);
+                m_WaitUntillReadyCoroutine = null;
             }
+        }
+
+        private void StopMusicPlaybackLoop()
+        {
+            if (m_WaitAndPlayNextSongCoroutine == null)
+                return;
+
+            CP_SDK.Unity.MTCoroutineStarter.Stop(m_WaitAndPlayNextSongCoroutine);
+            m_WaitAndPlayNextSongCoroutine = null;
+        }
+
+        private bool TryPlayMusic(Data.Music music, AudioClip clip)
+        {
+            try
+            {
+                StopMusicPlaybackLoop();
+                m_CurrentMusic = music;
+                m_CurrentMusicAudioClip = clip;
+                m_PreviewPlayer._defaultAudioClip = clip;
+
+                float volume = PlaybackVolume;
+                SetPlaybackVolume(volume);
+
+                float startTime = MMConfig.Instance.StartSongFromBeginning || clip.length < 60f
+                    ? 0f : UnityEngine.Random.Range(clip.length * 0.2f, clip.length * 0.8f);
+                m_PreviewPlayer.CrossfadeTo(clip, volume, startTime, -1f, () => { });
+
+                m_BackupTimeClip = clip;
+                m_BackupTime = startTime;
+                if (m_PlayerFloatingPanelView)
+                    m_PlayerFloatingPanelView.OnMusicChanged(music);
+
+                m_WaitAndPlayNextSongCoroutine = CP_SDK.Unity.MTCoroutineStarter.Start(Coroutine_WaitAndPlayNextMusic(clip.length));
+                return true;
+            }
+            catch (Exception error)
+            {
+                Logger.Instance.Error("Can't play audio! Exception: ");
+                Logger.Instance.Error(error);
+                return false;
+            }
+        }
+
+        private float PlaybackVolume => HasAudioTweaker ? 1f : MMConfig.Instance.PlaybackVolume;
+
+        private bool HasAudioTweaker => CP_SDK.ChatPlexSDK.GetModules().Any(x => x.Name == "Audio Tweaker");
+
+        private void ApplyPlaybackVolume()
+        {
+            if (Patches.ResultSoundPlayback.IsPlaying(m_PreviewPlayer))
+                return;
+
+            if (!HasAudioTweaker || m_PreviewPlayer._audioSourceControllers.Any(x =>
+                x.audioSource.isPlaying && x.audioSource.clip == m_CurrentMusicAudioClip))
+                SetPlaybackVolume(PlaybackVolume);
+        }
+
+        private void SetPlaybackVolume(float volume)
+        {
+            m_PreviewPlayer._ambientVolumeScale = volume;
+            m_PreviewPlayer._volumeScale = volume;
         }
         /// <summary>
         /// Wait and play next music
@@ -612,74 +603,74 @@ namespace ChatPlexMod_MenuMusic
 
             do
             {
-                /// Skip if it's not the menu
                 if (CP_SDK.ChatPlexSDK.ActiveGenericScene != CP_SDK.EGenericScene.Menu || !m_PreviewPlayer)
                 {
                     m_WaitAndPlayNextSongCoroutine = null;
                     yield break;
                 }
 
-                var l_ChannelsController = m_PreviewPlayer._audioSourceControllers;
-                if (l_ChannelsController != null)
+                if (Patches.ResultSoundPlayback.IsPlaying(m_PreviewPlayer))
                 {
-                    for (var l_I = 0; l_I < l_ChannelsController.Length; ++l_I)
-                    {
-                        var l_ChannelController = l_ChannelsController[l_I];
-                        var l_Channel           = l_ChannelController.audioSource;
-
-                        if (!m_IsPaused
-                            && !l_Channel.isPlaying
-                            && l_Channel.clip == m_CurrentMusicAudioClip
-                            && Array.IndexOf(l_ChannelsController, l_ChannelController) == m_PreviewPlayer._activeChannel)
-                        {
-                            l_Channel.UnPause();
-                        }
-
-                        if (l_Channel.isPlaying && l_Channel.clip == m_CurrentMusicAudioClip)
-                        {
-                            if (m_BackupTimeClip == null || m_BackupTimeClip != m_CurrentMusicAudioClip)
-                            {
-                                m_BackupTimeClip = m_CurrentMusicAudioClip;
-                                m_BackupTime     = l_Channel.time;
-                            }
-                            else if (Mathf.Abs(l_Channel.time - m_BackupTime) > 1f)
-                                l_Channel.time = m_BackupTime;
-                            else
-                                m_BackupTime = l_Channel.time;
-
-                            if (m_IsPaused)
-                                l_Channel.Pause();
-                            else
-                            {
-                                var l_Volume = MMConfig.Instance.PlaybackVolume;
-                                if (CP_SDK.ChatPlexSDK.GetModules().Any(x => x.Name == "Audio Tweaker"))
-                                    l_Volume = 1.0f;
-
-                                m_PreviewPlayer._ambientVolumeScale = l_Volume;
-                                m_PreviewPlayer._volumeScale        = l_Volume;
-                            }
-
-                            if (Mathf.Abs(p_EndTime - l_Channel.time) < (MMConfig.Instance.LoopCurrentMusic ? l_Interval : 3f))
-                            {
-                                m_WaitAndPlayNextSongCoroutine = null;
-                                if (MMConfig.Instance.LoopCurrentMusic && l_Channel.clip.length >= 10f)
-                                {
-                                    l_Channel.time = 0f;
-                                    m_BackupTime   = 0f;
-                                }
-                                else
-                                {
-                                    StartNextMusic();
-                                    yield break;
-                                }
-                            }
-                        }
-                    }
+                    yield return l_Waiter;
+                    continue;
                 }
+
+                if (UpdateMusicPlayback(p_EndTime, l_Interval))
+                    yield break;
 
                 yield return l_Waiter;
 
             } while (true);
+        }
+
+        private bool UpdateMusicPlayback(float endTime, float interval)
+        {
+            var channels = m_PreviewPlayer._audioSourceControllers;
+            for (int i = 0; i < channels.Length; i++)
+            {
+                var source = channels[i].audioSource;
+                if (source.clip != m_CurrentMusicAudioClip)
+                    continue;
+
+                if (!m_IsPaused && !source.isPlaying && i == m_PreviewPlayer._activeChannel)
+                    source.UnPause();
+                if (!source.isPlaying)
+                    continue;
+
+                RestoreMusicPosition(source);
+                if (m_IsPaused)
+                    source.Pause();
+                else
+                    SetPlaybackVolume(PlaybackVolume);
+
+                if (Mathf.Abs(endTime - source.time) >= (MMConfig.Instance.LoopCurrentMusic ? interval : 3f))
+                    continue;
+                if (MMConfig.Instance.LoopCurrentMusic && source.clip.length >= 10f)
+                {
+                    source.time = 0f;
+                    m_BackupTime = 0f;
+                }
+                else
+                {
+                    m_WaitAndPlayNextSongCoroutine = null;
+                    StartNextMusic();
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private void RestoreMusicPosition(AudioSource source)
+        {
+            if (m_BackupTimeClip == null || m_BackupTimeClip != m_CurrentMusicAudioClip)
+            {
+                m_BackupTimeClip = m_CurrentMusicAudioClip;
+                m_BackupTime = source.time;
+            }
+            else if (Mathf.Abs(source.time - m_BackupTime) > 1f)
+                source.time = m_BackupTime;
+            else
+                m_BackupTime = source.time;
         }
     }
 }
