@@ -321,30 +321,29 @@ namespace ChatPlexMod_ChatIntegrations.Events
         /// </summary>
         private void CreateOrUpdateReward()
         {
+            var l_TwitchHelix = CP_SDK.Chat.Service.Multiplexer.Services.OfType<CP_SDK.Chat.Services.Twitch.TwitchService>().FirstOrDefault()?.HelixAPI;
+            if (l_TwitchHelix == null)
+                return;
+
             if (UI.SettingsMainView.Instance != null)
                 UI.SettingsMainView.Instance.ShowLoadingModal();
 
             if (string.IsNullOrEmpty(Model.RewardID))
-                CreateOrUpdateReward_Callback(null);
+                CreateOrUpdateReward_Callback(l_TwitchHelix, null);
             else
             {
-                var l_TwitchService = CP_SDK.Chat.Service.Multiplexer.Services.FirstOrDefault(x => x is CP_SDK.Chat.Services.Twitch.TwitchService);
-                var l_TwitchHelix   = l_TwitchService != null ? (l_TwitchService as CP_SDK.Chat.Services.Twitch.TwitchService).HelixAPI : null;
                 var l_URL           = $"https://api.twitch.tv/helix/channel_points/custom_rewards?broadcaster_id={l_TwitchHelix.BroadcasterUserID}&id={Model.RewardID}";
 
-                if (l_TwitchHelix != null)
-                    l_TwitchHelix.WebClient.GetAsync(l_URL, CancellationToken.None, CreateOrUpdateReward_Callback, true);
+                l_TwitchHelix.WebClient.GetAsync(l_URL, CancellationToken.None, x => CreateOrUpdateReward_Callback(l_TwitchHelix, x), true);
             }
         }
         /// <summary>
         /// Create or update the reward on twitch
         /// </summary>
-        private void CreateOrUpdateReward_Callback(CP_SDK.Network.WebResponse p_GetReply)
+        private void CreateOrUpdateReward_Callback(CP_SDK.Chat.Services.Twitch.TwitchHelix p_TwitchHelix, CP_SDK.Network.WebResponse p_GetReply)
         {
-            var l_TwitchService = CP_SDK.Chat.Service.Multiplexer.Services.FirstOrDefault(x => x is CP_SDK.Chat.Services.Twitch.TwitchService);
-            var l_TwitchHelix   = l_TwitchService != null ? (l_TwitchService as CP_SDK.Chat.Services.Twitch.TwitchService).HelixAPI : null;
             var l_ShouldCreate  = p_GetReply == null || !p_GetReply.IsSuccessStatusCode;
-            var l_URL           = $"https://api.twitch.tv/helix/channel_points/custom_rewards?broadcaster_id={l_TwitchHelix.BroadcasterUserID}";
+            var l_URL           = $"https://api.twitch.tv/helix/channel_points/custom_rewards?broadcaster_id={p_TwitchHelix.BroadcasterUserID}";
 
             if (l_ShouldCreate)
             {
@@ -439,9 +438,9 @@ namespace ChatPlexMod_ChatIntegrations.Events
             };
 
             if (l_ShouldCreate)
-                l_TwitchHelix.WebClient.PostAsync(l_URL, CP_SDK.Network.WebContent.FromJson(l_Content), CancellationToken.None, l_Callback, true);
+                p_TwitchHelix.WebClient.PostAsync(l_URL, CP_SDK.Network.WebContent.FromJson(l_Content), CancellationToken.None, l_Callback, true);
             else
-                l_TwitchHelix.WebClient.PatchAsync(l_URL, CP_SDK.Network.WebContent.FromJson(l_Content), CancellationToken.None, l_Callback, true);
+                p_TwitchHelix.WebClient.PatchAsync(l_URL, CP_SDK.Network.WebContent.FromJson(l_Content), CancellationToken.None, l_Callback, true);
         }
         /// <summary>
         /// Delete the reward on twitch

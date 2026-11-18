@@ -277,7 +277,7 @@ namespace ChatPlexMod_ChatIntegrations.Actions
 
         public override IEnumerator Eval(Models.EventContext p_Context)
         {
-            var l_Channel = CP_SDK.Chat.Service.Multiplexer.Channels.First();
+            var l_Channel = CP_SDK.Chat.Service.Multiplexer.Channels.FirstOrDefault();
             if (l_Channel.Item2 is CP_SDK.Chat.Models.Twitch.TwitchChannel l_TwitchChannel)
             {
                 if (l_TwitchChannel.Roomstate.EmoteOnly)
